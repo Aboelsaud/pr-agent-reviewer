@@ -50,7 +50,7 @@ func NewOllamaAdapter() *OllamaAdapter {
 	return &OllamaAdapter{
 		baseURL:    baseURL,
 		model:      model,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: &http.Client{Timeout: 180 * time.Second},
 	}
 }
 

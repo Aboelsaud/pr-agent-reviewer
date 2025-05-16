@@ -4,63 +4,121 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"pr-agent-reviewer/logger"
 
-	"github.com/google/go-github/v57/github"
-	"golang.org/x/oauth2"
+	gh "github.com/google/go-github/v57/github"
 )
 
+// Client represents a GitHub client
 type Client struct {
-	client *github.Client
-	ctx    context.Context
+	client *gh.Client
 }
 
+// NewClient creates a new GitHub client
 func NewClient() *Client {
-	ctx := context.Background()
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: os.Getenv("GITHUB_ACCESS_TOKEN")},
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		logger.LogError("GITHUB_TOKEN environment variable is not set", nil)
+		return nil
+	}
+
+	client := gh.NewClient(nil).WithAuthToken(token)
+	return &Client{client: client}
+}
+
+// GetChanges implements the vcs.Provider interface
+func (c *Client) GetChanges(repo string, prNumber int) ([]string, error) {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid repository format: %s", repo)
+	}
+	owner, repoName := parts[0], parts[1]
+
+	logger.LogInfo("Getting changes for PR #%d in %s", prNumber, repo)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	files, _, err := c.client.PullRequests.ListFiles(
+		ctx,
+		owner,
+		repoName,
+		prNumber,
+		nil,
 	)
-	tc := oauth2.NewClient(ctx, ts)
-	client := github.NewClient(tc)
-
-	logger.LogInfo("GitHub client initialized")
-	return &Client{
-		client: client,
-		ctx:    ctx,
+	if err != nil {
+		logger.LogError("Failed to get PR changes", err)
+		return nil, fmt.Errorf("failed to get PR changes: %v", err)
 	}
+
+	var changes []string
+	for _, file := range files {
+		changes = append(changes, fmt.Sprintf("File: %s\nPatch:\n%s", file.GetFilename(), file.GetPatch()))
+	}
+
+	return changes, nil
 }
 
-func (c *Client) GetPRChanges(owner, repo string, prNumber int) ([]*github.CommitFile, error) {
-	logger.LogInfo("Fetching changes for PR #%d in %s/%s", prNumber, owner, repo)
-	
-	files, _, err := c.client.PullRequests.ListFiles(c.ctx, owner, repo, prNumber, nil)
+// CreateReview implements the vcs.Provider interface
+func (c *Client) CreateReview(repo string, prNumber int, review string) error {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid repository format: %s", repo)
+	}
+	owner, repoName := parts[0], parts[1]
+
+	logger.LogInfo("Creating review for PR #%d in %s", prNumber, repo)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Get PR details to check the author
+	pr, _, err := c.client.PullRequests.Get(ctx, owner, repoName, prNumber)
 	if err != nil {
-		logger.LogError("Failed to get PR files", err)
-		return nil, fmt.Errorf("failed to get PR files: %v", err)
+		return fmt.Errorf("failed to get PR details: %v", err)
 	}
 
-	logger.LogInfo("Successfully retrieved %d files from PR #%d", len(files), prNumber)
-	return files, nil
-}
-
-func (c *Client) CreateReview(owner, repo string, prNumber int, review *github.PullRequestReviewRequest) error {
-	logger.LogInfo("Creating review for PR #%d in %s/%s", prNumber, owner, repo)
-	
-	_, _, err := c.client.PullRequests.CreateReview(c.ctx, owner, repo, prNumber, review)
-	if err != nil {
-		logger.LogError("Failed to create review", err)
-		return fmt.Errorf("failed to create review: %v", err)
+	// Determine the review event based on the PR author
+	event := "REQUEST_CHANGES"
+	botUsername := os.Getenv("GITHUB_BOT_USERNAME")
+	if botUsername != "" && pr.GetUser().GetLogin() == botUsername {
+		event = "COMMENT"
+		logger.LogInfo("Using COMMENT event for self-authored PR (author: %s, bot: %s)", pr.GetUser().GetLogin(), botUsername)
+	} else {
+		logger.LogInfo("Using REQUEST_CHANGES event (author: %s, bot: %s)", pr.GetUser().GetLogin(), botUsername)
 	}
 
-	logger.LogInfo("Successfully created review for PR #%d", prNumber)
+	// Create a review with a comment indicating requested changes
+	reviewRequest := &gh.PullRequestReviewRequest{
+		Body:  gh.String(review),
+		Event: gh.String(event),
+	}
+
+	_, _, err = c.client.PullRequests.CreateReview(
+		ctx,
+		owner,
+		repoName,
+		prNumber,
+		reviewRequest,
+	)
+	if err != nil {
+		logger.LogError("Failed to create PR review", err)
+		return fmt.Errorf("failed to create PR review: %v", err)
+	}
+
 	return nil
 }
 
-func (c *Client) GetPRDetails(owner, repo string, prNumber int) (*github.PullRequest, error) {
+func (c *Client) GetPRDetails(owner, repo string, prNumber int) (*gh.PullRequest, error) {
 	logger.LogInfo("Fetching details for PR #%d in %s/%s", prNumber, owner, repo)
 	
-	pr, _, err := c.client.PullRequests.Get(c.ctx, owner, repo, prNumber)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pr, _, err := c.client.PullRequests.Get(ctx, owner, repo, prNumber)
 	if err != nil {
 		logger.LogError("Failed to get PR details", err)
 		return nil, fmt.Errorf("failed to get PR details: %v", err)
